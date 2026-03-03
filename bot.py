@@ -112,8 +112,8 @@ BID_CAP_MAX = 0.60   # Never bid above 60% of pot
 # When the opponent wins the auction (they see one of their cards), the bot
 # plays more conservatively. AUCTION_LOSS_K is a multiplier close to 1.0 that
 # gently tightens bluff frequency and shifts equity thresholds upward.
-# Value of 0.84 means a 16% tightening effect.
-AUCTION_LOSS_K = 0.84
+# Value of 0.80 means a 20% tightening effect.
+AUCTION_LOSS_K = 0.80
 
 # Minimum auction wins before we fully trust revealed card adjustments.
 # Below this, adjustments are dampened proportionally.
@@ -134,7 +134,7 @@ POSITION_IP_EQ_BONUS    =  0.02   # Add to equity when in position (SB)
 POSITION_OOP_EQ_DELTA   = -0.02   # Subtract from equity when out of position (BB)
 POSITION_IP_BLUFF_SCALE =  1.10   # Multiply bluff frequency by 1.1 when in position
 POSITION_OOP_BLUFF_SCALE =  0.84   # Multiply bluff frequency by 0.84 when out of position
-POSITION_BB_CALL_BONUS  =  0.04   # Lower the call threshold by 0.04 for BB (close the action discount)
+POSITION_BB_CALL_BONUS  =  0.03   # Lower the call threshold by 0.03 for BB (close the action discount)
 
 # When facing an aggressive opponent with a strong hand, occasionally check
 # to induce a bet and then reraise (check-raise trap).
@@ -852,7 +852,7 @@ def spr_adjustment(spr: float, equity: float) -> float:
             adj -= 0.03    # Opponents can fold before getting it all in vs. monsters
 
     else:
-        if 0.45 <= equity < 0.56:
+        if 0.48 <= equity < 0.6:
             adj += 0.02    # Moderate equity hands gain a small boost in mid SPR
 
     return adj
@@ -1058,10 +1058,10 @@ class OpponentModel:
     def recent_vpip(self) -> float:
         """
         Recent pre-flop looseness using the exponential moving average.
-        Defaults to 0.6 (loose) until we have enough data to trust the EMA.
+        Defaults to 0.4 (loose) until we have enough data to trust the EMA.
         """
         if self.pf_total < 16 or self.ema_vpip is None:
-            return 0.6  # Default to loose until we have data
+            return 0.4 # Default to moderately loose until we have data
         return self.ema_vpip
 
     @property
@@ -1105,7 +1105,7 @@ class OpponentModel:
             RANGE_TIGHT  (0.30) if opponent plays few hands (tight).
             RANGE_LOOSE  (0.96) if opponent plays many hands (loose) OR
                                  if we don't yet have enough data to trust the model.
-            RANGE_MEDIUM (0.50) for everything in between.
+            RANGE_MEDIUM (0.60) for everything in between.
         """
         if not self.sufficient_data():
             return RANGE_LOOSE   # Default to no constraint until we have data
@@ -1835,15 +1835,15 @@ def estimate_shove_range(opp_model) -> float:
     Falls back to a conservative default before sufficient data.
     """
     if not opp_model.sufficient_data():
-        return 0.16   # Default: assume top 15% when no data
+        return 0.16   # Default: assume top 16% when no data
 
     # Shove range is roughly half their standard inferred range,
     # scaled down further if they are passive pre-flop.
-    base_frac = opp_model.inferred_range_fraction() * 0.50
+    base_frac = opp_model.inferred_range_fraction() * 0.40
     if opp_model.preflop_aggression_rate < 0.30:
         base_frac *= 0.70   # Passive opponents shove even tighter
 
-    return max(0.08, min(0.32, base_frac))
+    return max(0.08, min(0.16, base_frac))
 
 def decide_action(state: PokerState, equity: float,
                   strategy: AdaptiveStrategy,
@@ -1906,7 +1906,7 @@ def decide_action(state: PokerState, equity: float,
         value_t = 1.0 - AUCTION_LOSS_K * (1.0 - value_t)
 
         # Ensure fold threshold doesn't accidentally exceed the new call threshold.
-        fold_t = min(fold_t, call_t - 0.05)
+        fold_t = min(fold_t, call_t - 0.06)
 
     # --- Step 4: Basic pot geometry ---
     pot = state.pot
@@ -1938,15 +1938,20 @@ def decide_action(state: PokerState, equity: float,
     # Positional adjustment: being in position (SB) gives a small equity bonus;
     # being out of position (BB) gives a penalty.
     street = state.street
-    if street != 'pre-flop':
+    if street == 'pre-flop':
+        value_t += 0.05   # your pre-flop increase
         if is_bb:
-            eff_eq = max(0.0, eff_eq + POSITION_OOP_EQ_DELTA)
-        else:
+            call_t = max(call_t - POSITION_BB_CALL_BONUS, 0.30)
+            value_t *= 1.10
+    elif street == 'flop':
+        value_t += 0.04   # your flop increase
+    elif street == 'turn':
+        value_t += 0.03   # your turn increase
+    else:  # river
+        if not is_bb:
             eff_eq = min(1.0, eff_eq + POSITION_IP_EQ_BONUS)
-    elif street == 'pre-flop' and is_bb:
-        # BB is last to act pre-flop → slight calling range bonus.
-        call_t = max(call_t - POSITION_BB_CALL_BONUS, 0.30)
-        value_t = value_t * 1.10  # Require stronger hands to 3-bet from the BB pre-flop
+        else:
+            eff_eq = max(0.0, eff_eq + POSITION_OOP_EQ_DELTA)
 
     # Revealed card adjustment: modify equity, bluff scale, and size scale
     # based on the specific card revealed from the auction win.
@@ -1967,18 +1972,18 @@ def decide_action(state: PokerState, equity: float,
 
     # Draws get implied-odds bonus on flop/turn (lower call threshold).
     if is_draw:
-        call_t = max(call_t - 0.05, 0.30)
+        call_t = max(call_t - 0.04, 0.36)
         # Deep stacks amplify implied odds for draws.
         if spr > SPR_HIGH:
-            call_t = max(call_t - 0.03, 0.27)
+            call_t = max(call_t - 0.03, 0.36)
 
     # --- Step 6: Effective bluff frequency ---
     # Adjust bluffing frequency for board wetness:
     # Wet boards → bluff less (opponent has many draws and calls more).
     # Dry boards → bluff more (opponent has fewer continuing hands).
     # texture_bluff_scale: at wetness=0.5 → 1.0; at 0 → 1.2; at 1 → 0.8.
-    texture_bluff_scale = 1.0 + 0.4 * (0.5 - texture.wetness)
-    eff_bluff_f = max(0.0, min(0.50, bluff_f * texture_bluff_scale * rev_bluff_sc))
+    texture_bluff_scale = 1.0 + 0.4 * abs(0.5 - texture.wetness)
+    eff_bluff_f = max(0.0, min(0.25, bluff_f * texture_bluff_scale * rev_bluff_sc))
 
     # --- Step 7: Compute bet sizing fraction for this action ---
     
@@ -2078,19 +2083,19 @@ def decide_action(state: PokerState, equity: float,
 
     else:
         # --- Pre-flop near-all-in: shove/fold decision ---
-        if ctc >= state.my_chips * 0.8 and street == 'pre-flop':
+        if ctc >= state.my_chips * 0.7 and street == 'pre-flop':
             shove_range = estimate_shove_range(strategy.model)
             eff_eq = monte_carlo_equity(hole, [], [], MC_SIMS_AUCTION, shove_range)
-            return ActionCall() if eff_eq > 0.54 else ActionFold()
+            return ActionCall() if eff_eq > 0.56 else ActionFold()
 
         # --- River-specific adjustments when facing a bet ---
         if street == 'river':
             # vs passive on river: lower call threshold (exploit value-heavy bets).
             # vs aggressive on river: also lower call threshold (pick off bluffs).
             if strategy.model.sufficient_data() and strategy.model.is_passive():
-                call_t_river = max(call_t - 0.04, 0.30)
+                call_t_river = max(call_t - 0.04, 0.32)
             elif strategy.model.sufficient_data() and strategy.model.is_aggressive():
-                call_t_river = max(call_t - 0.03, 0.32)
+                call_t_river = max(call_t - 0.02, 0.36)
             else:
                 call_t_river = call_t
 
@@ -2310,7 +2315,7 @@ class Player(BaseBot):
             self._revealed_card  = opp_revealed[0]   # Store for use in decide_action()
             self._opp_won_auction = False
 
-        elif self._our_auction_bid > 0:
+        else:
             # We bid but received no reveal → opponent outbid us.
             self._opp_won_auction = True
 

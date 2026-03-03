@@ -1531,7 +1531,7 @@ def revealed_card_adjustment(revealed_card: str, board: list, auctions_won: int 
 
     elif rank <= REVEALED_LOW_RANK:
         # Opponent has a 7 or below → they are weak, but dampen if it connects.
-        dampen = 0.5 if connects_to_board else 1.0
+        dampen = 0.6 if connects_to_board else 1.0
         eq_d  = REVEALED_LOW_EQ_DELTA * dampen * confidence
         bl_sc = 1.0 + (REVEALED_LOW_BLUFF_SCALE - 1.0) * dampen * confidence
         sz_sc = 1.0 + (REVEALED_LOW_SIZE_SCALE  - 1.0) * dampen * confidence
@@ -1592,8 +1592,8 @@ def dynamic_max_bid_frac(pot: int, effective_stack: int) -> float:
 
 
 # Tuning constants for the auction equity estimation sub-routines.
-AUC_BATCH_TRIALS = 50  # Total MC trials for batched auction equity estimation
-AUC_LOSE_FRAC    = 0.35 # Fallback range tightening if no opponent data (35% of range)
+AUC_BATCH_TRIALS = 60  # Total MC trials for batched auction equity estimation
+AUC_LOSE_FRAC    = 0.40 # Fallback range tightening if no opponent data (35% of range)
 
 
 def _dynamic_lose_frac(opp_range_fraction: float, strategy: AdaptiveStrategy) -> float:
@@ -1616,7 +1616,7 @@ def _dynamic_lose_frac(opp_range_fraction: float, strategy: AdaptiveStrategy) ->
     """
     model = strategy.model
 
-    base_frac = opp_range_fraction * 0.50
+    base_frac = opp_range_fraction * 0.60
 
     if model.sufficient_data():
         agg_rate           = model.opp_post_auction_bet_rate
@@ -1726,7 +1726,7 @@ def compute_bid(state: PokerState,
 
     Algorithm:
         1. Compute baseline equity without any information advantage.
-        2. Short-circuit to bid 0 if equity is extreme (≥84% or ≤16%):
+        2. Short-circuit to bid 0 if equity is extreme (≥80% or ≤20%):
            at these extremes, knowing one card rarely changes our best action.
         3. Estimate eq_win = equity if we see the opponent's card.
         4. Estimate eq_lose = equity if opponent sees their own card.
@@ -1756,8 +1756,8 @@ def compute_bid(state: PokerState,
                                 opp_range_fraction=opp_range_fraction)
 
     # Step 2: Information is irrelevant at the extremes — we know what to do.
-    if equity >= 0.84 or equity <= 0.16:
-        return SMALL_BLIND
+    if equity >= 0.80 or equity <= 0.20:
+        return BIG_BLIND
 
     excluded = set(hole + board + opp)
 
@@ -1770,7 +1770,7 @@ def compute_bid(state: PokerState,
 
     # Step 6: Marginal factor — peaks at equity=0.50 (maximum uncertainty).
     # 4 × 0.5 × 0.5 = 1.0 (maximum); Cap at 0.64 to prevent overbidding on very strong marginal hands.
-    marginal_factor = min(4.0 * equity * (1.0 - equity), 0.64)
+    marginal_factor = min(4.0 * equity * (1.0 - equity), 0.84)
 
     # Step 7: Adaptive bid multiplier from auction win rate history.
     adapt_mult = strategy.bid_multiplier()
@@ -1783,10 +1783,8 @@ def compute_bid(state: PokerState,
     # Enforce a minimum bid: at least 1 big blind if our auction win rate is
     # poor (< 30%), otherwise 1 small blind. Prevents bidding trivially small amounts.
     min_bid  = BIG_BLIND
-    if strategy.model.our_auction_win_rate <= 0.3:
-        min_bid += SMALL_BLIND
-    elif strategy.model.our_auction_win_rate > 0.7:
-        min_bid -= SMALL_BLIND
+    if strategy.model.our_auction_win_rate < 0.3:
+        min_bid += BIG_BLIND  # Add extra big blind if we are losing auctions badly
     
     raw_bid  = max(raw_bid, min_bid)
 
@@ -1794,10 +1792,14 @@ def compute_bid(state: PokerState,
     eff_stack    = min(state.my_chips, getattr(state, 'opp_chips', state.my_chips))
     dyn_cap_frac = dynamic_max_bid_frac(state.pot, eff_stack)
     max_bid      = int(state.pot * dyn_cap_frac)
+    max_bid      = max(max_bid, min_bid)  # Ensure cap is not below our minimum bid
     bid          = int(raw_bid)
 
     # Final clamp: bid must not exceed our chip stack or the pot cap.
-    return min(bid, max_bid, state.my_chips)
+    final_bid = min(bid, max_bid)
+    noise = 1.0 + random.uniform(-0.04,0.04) # Add up to ±4% random noise to the final bid for unpredictability
+    final_bid = int(final_bid * noise)
+    return min(final_bid, state.my_chips)
 
 
 # =============================================================================

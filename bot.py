@@ -1956,7 +1956,7 @@ def decide_action(state: PokerState, equity: float,
     if we_won_auction and revealed_card and street != 'pre-flop':
         board = list(state.board) if state.board else []
         rev_eq_delta, rev_bluff_sc, rev_size_sc = revealed_card_adjustment(
-            revealed_card, board, auctions_won=strategy.model.ema_won_auction)
+            revealed_card, board, auctions_won=strategy.model.ema_won_auction or 0)
         eff_eq = max(0.0, min(1.0, eff_eq + rev_eq_delta))
 
     # --- Step 5b: Draw detection for sizing/threshold adjustments ---

@@ -124,8 +124,8 @@ AUCTION_CONFIDENCE_MIN = 16
 # genuinely strengthened their hand or they are very aggressive.
 OPP_AUCT_AGG_HIGH  = 0.65   # ≥65% → opponent almost always bets with auction card
 OPP_AUCT_AGG_LOW   = 0.30   # ≤30% → opponent often traps or slow-plays
-OPP_AUCT_FOLD_BUMP = 0.07   # Raise fold threshold by this much vs. aggressive post-auction bettors
-OPP_AUCT_CALL_DIP  = 0.05   # Lower call threshold by this much vs. passive post-auction players
+OPP_AUCT_FOLD_BUMP = 0.05   # Raise fold threshold by this much vs. aggressive post-auction bettors
+OPP_AUCT_CALL_DIP  = 0.03   # Lower call threshold by this much vs. passive post-auction players
 
 # Equity and bluff adjustments based on the bot's table position.
 # In position (SB / not BB): slight equity bonus since we act last post-flop.
@@ -144,6 +144,9 @@ CHECK_RAISE_MIN_AGG = 0.40   # Minimum opponent postflop_aggression to trigger t
 # River-specific polarized sizing: bet big with value and bluffs (GTO polarization).
 RIVER_VALUE_SIZE      = 0.85  # Pot fraction for river value bets (polarized large)
 RIVER_BLUFF_REDUCTION = 0.60  # Multiply bluff frequency by this on the river
+
+def _sigmoid(x, mid, steepness=12.0):
+    return 1.0 / (1.0 + math.exp(-steepness * (x - mid)))
 
 
 # =============================================================================
@@ -1199,9 +1202,6 @@ class AdaptiveStrategy:
         vpip = m.recent_vpip
         agg  = m.postflop_aggression
 
-        def _sigmoid(x, mid, steepness=12.0):
-            return 1.0 / (1.0 + math.exp(-steepness * (x - mid)))
-
         tightness  = _sigmoid(vpip, 0.5)   # midpoint between tight<0.30 and loose>0.70
         aggression = _sigmoid(agg,  0.4)    # midpoint between passive<0.30 and aggro>0.50
 
@@ -1298,7 +1298,7 @@ class AdaptiveStrategy:
         """
         # Conservative default: not enough data to characterize behavior.
         if m.opp_won_auction_count < 5:
-            fold_t = min(fold_t + OPP_AUCT_FOLD_BUMP * 0.5, 0.45)
+            fold_t = min(fold_t + OPP_AUCT_FOLD_BUMP * 0.4, 0.45)
             return fold_t, call_t
 
         rate = m.opp_post_auction_bet_rate
@@ -1306,13 +1306,13 @@ class AdaptiveStrategy:
         if rate >= OPP_AUCT_AGG_HIGH:
             # Opponent almost always bets after winning → their hand is real.
             # Raise both fold and call thresholds to play tighter.
-            fold_t = min(fold_t + OPP_AUCT_FOLD_BUMP, 0.48)
-            call_t = min(call_t + 0.04, 0.58)
+            fold_t = min(fold_t + OPP_AUCT_FOLD_BUMP, 0.45)
+            call_t = min(call_t + OPP_AUCT_CALL_DIP, 0.60)
 
         elif rate <= OPP_AUCT_AGG_LOW:
             # Opponent rarely bets after winning → they may be slow-playing
             # or the card didn't help much. Allow lighter calls.
-            call_t = max(call_t - OPP_AUCT_CALL_DIP, 0.33)
+            call_t = max(call_t - OPP_AUCT_CALL_DIP, 0.35)
 
         return fold_t, call_t
 
@@ -1383,14 +1383,14 @@ class AdaptiveStrategy:
 # Thin sizing = used for marginal value hands or bluffs.
 # Strong sizing = used for premium value hands.
 _STREET_SIZING = {
-    'pre-flop': (0.4, 0.6),   # Half-pot to three-quarter pot pre-flop
-    'flop'    : (0.40, 0.55),   # Slightly under half-pot on the flop
-    'turn'    : (0.55, 0.70),   # Growing as pot builds
-    'river'   : (0.65, 0.90),   # Large bets to extract maximum value at showdown
+    'pre-flop': (0.4, 0.7),   # Half-pot to three-quarter pot pre-flop
+    'flop'    : (0.4, 0.6),   # Slightly under half-pot on the flop
+    'turn'    : (0.5, 0.7),   # Growing as pot builds
+    'river'   : (0.6, 0.9),   # Large bets to extract maximum value at showdown
 }
 
 
-def street_sizing(street: str, texture: BoardTexture, strong: bool) -> float:
+def street_sizing(street: str, texture: BoardTexture, strong: int) -> float:
     """
     Determine the appropriate bet sizing fraction for the current street and
     board texture.
@@ -1412,7 +1412,7 @@ def street_sizing(street: str, texture: BoardTexture, strong: bool) -> float:
         Float fraction of the pot to bet (e.g., 0.65 = 65% pot bet).
     """
     thin_f, big_f = _STREET_SIZING.get(street, (BET_SMALL_FRAC, BET_BIG_FRAC))
-    base = big_f if strong else thin_f
+    base = thin_f + (big_f - thin_f) * strong  # Linear interpolation between thin and big sizing
 
     # Wet board adjustment: scale bet size inversely with wetness.
     # wetness=0.5 → no change; wetness=1.0 → -0.10; wetness=0.0 → +0.10
@@ -1889,6 +1889,7 @@ def decide_action(state: PokerState, equity: float,
     # so require more equity before betting for value.
     if street_reraise_count > 0:
         value_t = min(0.90, value_t * (1.0 + 0.1 * street_reraise_count))
+        call_t = min(0.80, call_t  * (1.0 + 0.04 * street_reraise_count))
 
     # --- Step 3: Tighten ranges if opponent won the auction ---
     # When the opponent has superior information, we should be more conservative.
@@ -1978,7 +1979,8 @@ def decide_action(state: PokerState, equity: float,
     eff_bluff_f = max(0.0, min(0.50, bluff_f * texture_bluff_scale * rev_bluff_sc))
 
     # --- Step 7: Compute bet sizing fraction for this action ---
-    strong  = eff_eq >= value_t
+    
+    strong = _sigmoid(eff_eq, value_t-0.04, 30.0)  # Higher eff_eq → more likely to be strong hand
     sz_frac = street_sizing(street, texture, strong) * rev_size_sc
 
     # Draw vs. made hand sizing distinction:

@@ -1159,6 +1159,61 @@ def street_sizing(street: str, texture: BoardTexture, strong: int) -> float:
     return max(0.30, min(1.20, base + wet_adj))
 
 
+def board_lock_penalty(hole: list, board: list) -> float:
+    """
+    Return an equity penalty when hole cards contribute nothing beyond a kicker
+    on a double-paired or trips board — i.e., we are 'playing the board'.
+
+    On a fully-run-out board (5 cards), if neither hole card matches a paired
+    board rank, our apparent 'Two Pair' or hand strength is illusory: any
+    opponent card that connects to those paired ranks gives them a full house
+    or better, instantly crushing our kicker-only hand.
+
+    This situation arises on boards like 4c 4s Th 5c Ts when we hold Ax 2x —
+    eval7 rates us as 'Two Pair, Ace kicker' but we cannot beat any full house,
+    and calling a large bet is a significant mistake.
+
+    Returns:
+        Float in [0.0, 0.28] — equity to subtract from eff_eq.
+        0.28 if hole cards add nothing at all over the board alone.
+        0.18 if hole cards only contribute a kicker on a board-dominated hand.
+        0.0  if the board is not double-paired/trips, or our hole cards match
+             a paired rank (meaning we have a genuine full house or quads).
+    """
+    if len(board) != 5:
+        return 0.0
+
+    board_ranks = [card_rank(c) for c in board]
+    rank_counts: dict[int, int] = {}
+    for r in board_ranks:
+        rank_counts[r] = rank_counts.get(r, 0) + 1
+
+    paired_ranks = {r for r, cnt in rank_counts.items() if cnt >= 2}
+    has_trips_on_board = any(cnt >= 3 for cnt in rank_counts.values())
+
+    # Only penalize on double-paired or trips boards
+    if len(paired_ranks) < 2 and not has_trips_on_board:
+        return 0.0
+
+    hole_ranks = {card_rank(c) for c in hole}
+
+    # If a hole card matches a paired board rank → we have a full house or quads
+    if hole_ranks & paired_ranks:
+        return 0.0
+
+    # Neither hole card connects to the board's paired ranks.
+    # Compare our full hand against the board played alone.
+    board_score = eval7.evaluate([_e7(c) for c in board])
+    full_score  = eval7.evaluate([_e7(c) for c in hole + board])
+
+    if full_score <= board_score:
+        # Hole cards add nothing at all over the board
+        return 0.28
+
+    # Hole cards only improve the kicker — still very weak vs. board-connecting hands
+    return 0.18
+
+
 def is_drawing_hand(hole: list, board: list, texture: BoardTexture) -> bool:
     """
     Detect whether our hand is primarily a draw (flush draw or open-ended
@@ -1631,6 +1686,14 @@ def decide_action(state: PokerState, equity: float,
         if spr > SPR_HIGH:
             call_t = max(call_t - 0.03, 0.36)
 
+    # River: penalize hands that merely play a paired/trips board with a kicker.
+    # eval7 reports these as "Two Pair, Ace Kicker" etc., inflating MC equity.
+    # Any opponent card that connects to the board's paired ranks gives a full
+    # house, making our kicker-only hand nearly worthless against a bet.
+    if street == 'river' and len(board_list) == 5:
+        lock_pen = board_lock_penalty(hole, board_list)
+        eff_eq = max(0.0, eff_eq - lock_pen)
+
     texture_bluff_scale = 1.0 + 0.4 * abs(0.5 - texture.wetness)
     eff_bluff_f = max(0.0, min(0.25, bluff_f * texture_bluff_scale * rev_bluff_sc))
 
@@ -1722,6 +1785,18 @@ def decide_action(state: PokerState, equity: float,
                 call_t_river = max(call_t - 0.02, 0.36)
             else:
                 call_t_river = call_t
+
+            # Overbet alarm: when the bet is a large multiple of the pre-bet pot,
+            # the opponent's range is heavily polarized toward nut hands.
+            # Recover pre-bet pot as (state.pot - ctc) in case state.pot already
+            # includes the current bet; clamp to 1 to avoid division by zero.
+            if ctc > 0 and pot > 0:
+                pre_bet_pot = max(1, pot - ctc)
+                bet_to_pre_pot = ctc / pre_bet_pot
+                if bet_to_pre_pot > 2.0:
+                    # e.g. 3x pot → floor ≈ 0.56; 17x pot → floor ≈ 0.70 (capped at 0.78)
+                    overbet_floor = min(0.78, 0.55 + (bet_to_pre_pot - 2.0) * 0.01)
+                    call_t_river = max(call_t_river, overbet_floor)
 
             if eff_eq >= value_t:
                 if state.can_act(ActionRaise):

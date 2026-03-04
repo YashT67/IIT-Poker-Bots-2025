@@ -12,7 +12,7 @@ This bot plays heads-up (2-player) poker. It uses:
 
 Entry point: `Player.get_move()` is called each time the bot must act.
 """
-
+import numpy as np
 import random
 import math
 import eval7
@@ -1087,6 +1087,7 @@ class AdaptiveStrategy:
         xp = [0.00, 0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 1.0]
         yp = [3.00, 2.20, 1.70, 1.10, 0.60, 0.30, 0.10, -0.20]
 
+        bm_delta = float(np.interp(wr, xp, yp))
         return 1.0 + bm_delta * dampen
 
     def describe(self) -> str:

@@ -1071,9 +1071,9 @@ class AdaptiveStrategy:
     def bid_multiplier(self) -> float:
         """
         Scale our raw computed auction bid based on our recent auction win rate.
-        If we are losing too many auctions (win rate < 25%), bid higher to
+        If we are losing too many auctions, bid higher to
         compete more aggressively and gain more information.
-        If we are winning almost all auctions (win rate > 75%), bid lower
+        If we are winning almost all auctions, bid lower
         to avoid overpaying for information we tend to get anyway.
         Returns:
             Float multiplier applied to the raw computed bid amount.
@@ -1084,13 +1084,8 @@ class AdaptiveStrategy:
         bm_delta = 0.0
         dampen=min(1.0, m.auction_rounds / 16.0)
 
-        if wr <= 0.10: bm_delta = 2.00
-        elif wr <= 0.20: bm_delta = 1.60
-        elif wr <= 0.30: bm_delta = 1.10
-        elif wr <= 0.40: bm_delta = 0.60
-        elif wr <= 0.50: bm_delta = 0.30
-        elif wr > 0.7: bm_delta = -0.10
-        else: bm_delta = 0.10
+        xp = [0.00, 0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 1.0]
+        yp = [3.00, 2.20, 1.70, 1.10, 0.60, 0.30, 0.10, -0.20]
 
         return 1.0 + bm_delta * dampen
 
@@ -1525,9 +1520,6 @@ def compute_bid(state: PokerState,
     equity = monte_carlo_equity(hole, board, opp,
                                 n_sims=MC_SIMS_AUCTION,
                                 opp_range_fraction=opp_range_fraction)
-
-    if equity >= 0.80 or equity <= 0.20:
-        return BIG_BLIND
 
     excluded = set(hole + board + opp)
 

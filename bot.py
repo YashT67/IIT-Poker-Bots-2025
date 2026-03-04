@@ -68,10 +68,15 @@ REVEALED_LOW_EQ_DELTA    = 0.02
 REVEALED_LOW_BLUFF_SCALE = 1.10
 REVEALED_LOW_SIZE_SCALE  = 1.15
 
+REVEALED_MID_EQ_DELTA    = -0.02
+REVEALED_MID_BLUFF_SCALE = 0.80
+REVEALED_MID_SIZE_SCALE  = 0.90
+
 BID_CAP_MIN = 0.25
 BID_CAP_MAX = 0.64
 
 AUCTION_LOSS_K = 0.80
+AUCTION_WIN_K  = 1.10
 
 AUCTION_CONFIDENCE_MIN = 16
 
@@ -89,7 +94,7 @@ POSITION_BB_CALL_BONUS  =  0.03
 CHECK_RAISE_FREQ    = 0.28
 CHECK_RAISE_MIN_AGG = 0.40
 
-RIVER_VALUE_SIZE      = 0.85
+RIVER_VALUE_SIZE      = 0.80
 RIVER_BLUFF_REDUCTION = 0.60
 
 def _sigmoid(x, mid, steepness=12.0):
@@ -819,7 +824,7 @@ class OpponentModel:
         Fraction of auction phases where our bot won and received a card reveal.
         Starts at 0.4 (bet more aggressively) before any auctions are seen.
         """
-        return self.ema_won_auction if self.auction_rounds > 8 else 0.4
+        return self.ema_won_auction if self.ema_won_auction is not None else 0.4
 
     @property
     def opp_post_auction_bet_rate(self) -> float:
@@ -869,7 +874,7 @@ class OpponentModel:
     # ---- Archetype classifiers ----
 
     def is_tight(self)      -> bool: return self.recent_vpip < 0.30
-    def is_loose(self)      -> bool: return self.recent_vpip > 0.70
+    def is_loose(self)      -> bool: return self.recent_vpip > 0.60
     def is_aggressive(self) -> bool: return self.postflop_aggression > 0.50
     def is_passive(self)    -> bool: return self.postflop_aggression < 0.30
     def is_folder(self)     -> bool: return self.recent_fold_rate > 0.30
@@ -970,7 +975,7 @@ class AdaptiveStrategy:
         vpip = m.recent_vpip
         agg  = m.postflop_aggression
 
-        tightness  = _sigmoid(vpip, 0.5)
+        tightness  = _sigmoid(vpip, 0.45)
         aggression = _sigmoid(agg,  0.4)
 
         w_tp = (1.0 - tightness) * (1.0 - aggression)   # tight-passive
@@ -1075,18 +1080,19 @@ class AdaptiveStrategy:
         """
         m = self.model
 
-        if m.auction_rounds < 15:
-            return 1.0
-
         wr = m.our_auction_win_rate
+        bm_delta = 0.0
+        dampen=min(1.0, m.auction_rounds / 16.0)
 
-        if wr < 0.10: return 2.50
-        elif wr < 0.20: return 2.00
-        elif wr < 0.30: return 1.6
-        elif wr < 0.40: return 1.4
-        elif wr > 0.8: return 0.70
-        elif wr > 0.6: return 0.90
-        return 1.10
+        if wr <= 0.10: bm_delta = 2.00
+        elif wr <= 0.20: bm_delta = 1.60
+        elif wr <= 0.30: bm_delta = 1.10
+        elif wr <= 0.40: bm_delta = 0.60
+        elif wr <= 0.50: bm_delta = 0.30
+        elif wr > 0.7: bm_delta = -0.10
+        else: bm_delta = 0.10
+
+        return 1.0 + bm_delta * dampen
 
     def describe(self) -> str:
         """
@@ -1157,6 +1163,61 @@ def street_sizing(street: str, texture: BoardTexture, strong: int) -> float:
     wet_adj = (texture.wetness - 0.5) * (-0.20)
 
     return max(0.30, min(1.20, base + wet_adj))
+
+
+def board_lock_penalty(hole: list, board: list) -> float:
+    """
+    Return an equity penalty when hole cards contribute nothing beyond a kicker
+    on a double-paired or trips board — i.e., we are 'playing the board'.
+
+    On a fully-run-out board (5 cards), if neither hole card matches a paired
+    board rank, our apparent 'Two Pair' or hand strength is illusory: any
+    opponent card that connects to those paired ranks gives them a full house
+    or better, instantly crushing our kicker-only hand.
+
+    This situation arises on boards like 4c 4s Th 5c Ts when we hold Ax 2x —
+    eval7 rates us as 'Two Pair, Ace kicker' but we cannot beat any full house,
+    and calling a large bet is a significant mistake.
+
+    Returns:
+        Float in [0.0, 0.28] — equity to subtract from eff_eq.
+        0.28 if hole cards add nothing at all over the board alone.
+        0.18 if hole cards only contribute a kicker on a board-dominated hand.
+        0.0  if the board is not double-paired/trips, or our hole cards match
+             a paired rank (meaning we have a genuine full house or quads).
+    """
+    if len(board) != 5:
+        return 0.0
+
+    board_ranks = [card_rank(c) for c in board]
+    rank_counts: dict[int, int] = {}
+    for r in board_ranks:
+        rank_counts[r] = rank_counts.get(r, 0) + 1
+
+    paired_ranks = {r for r, cnt in rank_counts.items() if cnt >= 2}
+    has_trips_on_board = any(cnt >= 3 for cnt in rank_counts.values())
+
+    # Only penalize on double-paired or trips boards
+    if len(paired_ranks) < 2 and not has_trips_on_board:
+        return 0.0
+
+    hole_ranks = {card_rank(c) for c in hole}
+
+    # If a hole card matches a paired board rank → we have a full house or quads
+    if hole_ranks & paired_ranks:
+        return 0.0
+
+    # Neither hole card connects to the board's paired ranks.
+    # Compare our full hand against the board played alone.
+    board_score = eval7.evaluate([_e7(c) for c in board])
+    full_score  = eval7.evaluate([_e7(c) for c in hole + board])
+
+    if full_score <= board_score:
+        # Hole cards add nothing at all over the board
+        return 0.28
+
+    # Hole cards only improve the kicker — still very weak vs. board-connecting hands
+    return 0.18
 
 
 def is_drawing_hand(hole: list, board: list, texture: BoardTexture) -> bool:
@@ -1241,22 +1302,38 @@ def revealed_card_adjustment(revealed_card: str, board: list, auctions_won: int 
     board_ranks = [card_rank(c) for c in board]
 
     connects_to_board = any(abs(rank - br) <= 2 for br in board_ranks)
+    paired_to_board = any(rank == br for br in board_ranks)
 
     confidence = min(1.0, auctions_won / AUCTION_CONFIDENCE_MIN)
 
     if rank >= REVEALED_HIGH_RANK:
-        eq_d  = REVEALED_HIGH_EQ_DELTA    * confidence
-        bl_sc = 1.0 + (REVEALED_HIGH_BLUFF_SCALE - 1.0) * confidence
-        sz_sc = 1.0 + (REVEALED_HIGH_SIZE_SCALE  - 1.0) * confidence
+        dampen = 1.0
+        if connects_to_board:
+            dampen *= 1.1
+        if paired_to_board:
+            dampen *= 1.3
+        eq_d  = REVEALED_HIGH_EQ_DELTA    * confidence * dampen
+        bl_sc = 1.0 + (REVEALED_HIGH_BLUFF_SCALE - 1.0) * confidence * dampen
+        sz_sc = 1.0 + (REVEALED_HIGH_SIZE_SCALE  - 1.0) * confidence * dampen
         return (eq_d, bl_sc, sz_sc)
 
     elif rank <= REVEALED_LOW_RANK:
-        dampen = 0.6 if connects_to_board else 1.0
+        dampen = 1.0
+        if connects_to_board:
+            dampen *= 0.7
+        if paired_to_board:
+            dampen *= 0.5
         eq_d  = REVEALED_LOW_EQ_DELTA * dampen * confidence
         bl_sc = 1.0 + (REVEALED_LOW_BLUFF_SCALE - 1.0) * dampen * confidence
         sz_sc = 1.0 + (REVEALED_LOW_SIZE_SCALE  - 1.0) * dampen * confidence
         return (eq_d, bl_sc, sz_sc)
 
+    elif paired_to_board:
+        eq_d  = REVEALED_MID_EQ_DELTA
+        bl_sc = REVEALED_MID_BLUFF_SCALE
+        sz_sc = REVEALED_MID_SIZE_SCALE
+        return (eq_d, bl_sc, sz_sc)
+    
     return (0.0, 1.0, 1.0)
 
 # =============================================================================
@@ -1520,7 +1597,7 @@ def estimate_shove_range(opp_model) -> float:
         return 0.16
 
     base_frac = opp_model.inferred_range_fraction() * 0.40
-    if opp_model.preflop_aggression_rate < 0.30:
+    if opp_model.recent_vpip < 0.30:
         base_frac *= 0.70
 
     return max(0.08, min(0.16, base_frac))
@@ -1564,7 +1641,7 @@ def decide_action(state: PokerState, equity: float,
     
     if street_reraise_count > 0:
         value_t = min(0.90, value_t * (1.0 + 0.1 * street_reraise_count))
-        call_t = min(0.80, call_t  * (1.0 + 0.04 * street_reraise_count))
+        call_t = min(0.80, call_t  * (1.0 + 0.06 * street_reraise_count))
 
     if opp_won_auction:
         bluff_f *= AUCTION_LOSS_K
@@ -1573,10 +1650,16 @@ def decide_action(state: PokerState, equity: float,
         value_t = 1.0 - AUCTION_LOSS_K * (1.0 - value_t)
 
         fold_t = min(fold_t, call_t - 0.06)
+    else:
+        bluff_f *= AUCTION_WIN_K
 
     pot = state.pot
     ctc = state.cost_to_call
     hole = list(state.my_hand)
+
+    if opp_won_auction and ctc > max(BIG_BLIND, pot * 0.16):
+        call_t += 0.02
+        value_t += 0.02
 
     pot_odds = ctc / (pot + ctc) if (ctc > 0 and pot + ctc > 0) else 0.0
 
@@ -1631,6 +1714,14 @@ def decide_action(state: PokerState, equity: float,
         if spr > SPR_HIGH:
             call_t = max(call_t - 0.03, 0.36)
 
+    # River: penalize hands that merely play a paired/trips board with a kicker.
+    # eval7 reports these as "Two Pair, Ace Kicker" etc., inflating MC equity.
+    # Any opponent card that connects to the board's paired ranks gives a full
+    # house, making our kicker-only hand nearly worthless against a bet.
+    if street == 'river' and len(board_list) == 5:
+        lock_pen = board_lock_penalty(hole, board_list)
+        eff_eq = max(0.0, eff_eq - lock_pen)
+
     texture_bluff_scale = 1.0 + 0.4 * abs(0.5 - texture.wetness)
     eff_bluff_f = max(0.0, min(0.25, bluff_f * texture_bluff_scale * rev_bluff_sc))
 
@@ -1640,13 +1731,22 @@ def decide_action(state: PokerState, equity: float,
     if is_draw and not strong:
         sz_frac *= 0.80
     elif not is_draw and strong and texture.wetness > 0.35:
-        sz_frac *= 1.15
+        sz_frac *= 1.10
 
-    sz_frac = max(0.25, min(1.40, sz_frac))
+    sz_frac = max(0.20, min(1.20, sz_frac))
+
+    if state.can_act(ActionCheck):
+        temp_sz = (RIVER_VALUE_SIZE * rev_size_sc) if street == 'river' else sz_frac
+        proposed_raise = pot + int(pot * temp_sz)
+    else:
+        proposed_raise = int((pot + ctc) * 0.80)
+
+    if proposed_raise > state.my_chips * 0.70:
+        value_t += 0.02
 
     if spr < SPR_LOW and street != 'pre-flop':
-        if eff_eq >= 0.60:
-            if eff_eq < 0.64 and state.can_act(ActionCall):
+        if eff_eq >= 0.64:
+            if eff_eq < 0.72 and state.can_act(ActionCall):
                 return ActionCall()
             elif state.can_act(ActionRaise):
                 return ActionRaise(max_raise)
@@ -1722,6 +1822,18 @@ def decide_action(state: PokerState, equity: float,
                 call_t_river = max(call_t - 0.02, 0.36)
             else:
                 call_t_river = call_t
+
+            # Overbet alarm: when the bet is a large multiple of the pre-bet pot,
+            # the opponent's range is heavily polarized toward nut hands.
+            # Recover pre-bet pot as (state.pot - ctc) in case state.pot already
+            # includes the current bet; clamp to 1 to avoid division by zero.
+            if ctc > 0 and pot > 0:
+                pre_bet_pot = max(1, pot - ctc)
+                bet_to_pre_pot = ctc / pre_bet_pot
+                if bet_to_pre_pot > 2.0:
+                    # e.g. 3x pot → floor ≈ 0.56; 17x pot → floor ≈ 0.70 (capped at 0.78)
+                    overbet_floor = min(0.78, 0.55 + (bet_to_pre_pot - 2.0) * 0.01)
+                    call_t_river = max(call_t_river, overbet_floor)
 
             if eff_eq >= value_t:
                 if state.can_act(ActionRaise):
@@ -1866,7 +1978,7 @@ class Player(BaseBot):
         if self._pf_recorded or state.street != 'pre-flop':
             return
 
-        was_aggressive = state.cost_to_call > (BIG_BLIND - SMALL_BLIND)
+        was_aggressive = state.cost_to_call > BIG_BLIND
         self.opp_model.record_preflop(was_aggressive)
         self._pf_recorded = True
 
@@ -1912,7 +2024,7 @@ class Player(BaseBot):
             amount_paid = 0
             if self._chips_before_auction is not None and self._our_auction_bid > 0:
                 amount_paid = self._chips_before_auction - state.my_chips
-            if amount_paid > 0:
+            if amount_paid == self._our_auction_bid:
                 self._opp_won_auction = True
             else: self._opp_won_auction = False
 

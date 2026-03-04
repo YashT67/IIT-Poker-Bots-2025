@@ -880,32 +880,53 @@ class OpponentModel:
     def is_folder(self)     -> bool: return self.recent_fold_rate > 0.30
     def sufficient_data(self) -> bool: return self.hands_seen >= MODEL_MIN_HANDS
 
-    def inferred_range_fraction(self) -> float:
+    def inferred_range_fraction(self, street: str = 'pre-flop',
+                                opp_bet_this_street: bool = False,
+                                opp_won_auction: bool = False) -> float:
         """
         Translate the opponent's observed play style into a range fraction
         used to constrain Monte Carlo opponent hand sampling.
+        Pre-flop: uses VPIP tightness only, same as before.
+        Post-flop: multiplies the preflop base by a narrowing factor that
+        reflects how each street of action eliminates weak hands from the
+        opponent's continuing range.
+        Narrowing sources:
+          - Street depth: flop=0.85, turn=0.72, river=0.60 of the base.
+          - Opponent bet this street: further ×0.80 (betting = stronger range).
+          - Postflop aggression profile:
+              aggressive opponents bet wide → less narrowing (×1.12 cap 1.0).
+              passive opponents only bet strong → more narrowing (×0.88).
         Returns:
-            RANGE_TIGHT  (0.30) if opponent plays few hands (tight).
-            RANGE_LOOSE  (0.96) if opponent plays many hands (loose) OR
-                                 if we don't yet have enough data to trust the model.
-            RANGE_MEDIUM (0.60) for everything in between.
+            Float range fraction in [0.10, RANGE_LOOSE].
+            RANGE_TIGHT  (0.30) / RANGE_MEDIUM (0.60) / RANGE_LOOSE (0.96)
+            as the preflop base, then scaled down post-flop.
         """
         if not self.sufficient_data():
-            return RANGE_LOOSE
+            base = RANGE_LOOSE * RANGE_LOOSE
+        elif self.is_tight():
+            base = RANGE_TIGHT
+        elif self.is_loose():
+            base = RANGE_LOOSE
+        else:
+            base = RANGE_MEDIUM
+        if street in ('pre-flop', 'auction'):
+            return base
+        else: base = min(base*1.10, RANGE_LOOSE)
 
-        if self.is_tight():
-            return RANGE_TIGHT
-        if self.is_loose():
-            return RANGE_LOOSE
-        return RANGE_MEDIUM
+        street_factor = {'flop': 0.90, 'turn': 0.81, 'river': 0.72}.get(street, 1.0)
+        if opp_won_auction:
+            street_factor *= 0.80
+        elif opp_bet_this_street:
+            street_factor *= 0.90
 
-    def __str__(self):
-        """Debug-friendly string showing key model statistics."""
-        return (f'Hands={self.hands_seen}  VPIP={self.ema_vpip:.2f}  '
-                f'PF_agg={self.postflop_aggression:.2f}  '
-                f'Fold%={self.fold_rate:.2f}  '
-                f'AuctWin%={self.our_auction_win_rate:.2f}  '
-                f'OppPostAuctBet%={self.opp_post_auction_bet_rate:.2f}')
+        if self.sufficient_data():
+            if self.is_aggressive():
+                street_factor = min(street_factor * 1.20, 1.0)
+            elif self.is_passive():
+                street_factor *= 0.90
+
+        street_factor = min(street_factor, 0.90)
+        return max(0.16, base * street_factor)
 
 # =============================================================================
 # SECTION 10: ADAPTIVE STRATEGY ENGINE
@@ -1084,8 +1105,8 @@ class AdaptiveStrategy:
         bm_delta = 0.0
         dampen=min(1.0, m.auction_rounds / 16.0)
 
-        xp = [0.00, 0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 1.0]
-        yp = [3.00, 2.20, 1.70, 1.10, 0.60, 0.30, 0.10, -0.20]
+        xp = [0.00, 0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 1.00]
+        yp = [3.00, 2.20, 1.70, 1.10, 0.60, 0.30, 0.10, 0.40]
 
         bm_delta = float(np.interp(wr, xp, yp))
         return 1.0 + bm_delta * dampen
@@ -1655,6 +1676,7 @@ def decide_action(state: PokerState, equity: float,
         value_t += 0.02
 
     pot_odds = ctc / (pot + ctc) if (ctc > 0 and pot + ctc > 0) else 0.0
+    pot_odds = min(pot_odds, 0.70)
 
     min_raise, max_raise = state.raise_bounds
 
@@ -1816,10 +1838,6 @@ def decide_action(state: PokerState, equity: float,
             else:
                 call_t_river = call_t
 
-            # Overbet alarm: when the bet is a large multiple of the pre-bet pot,
-            # the opponent's range is heavily polarized toward nut hands.
-            # Recover pre-bet pot as (state.pot - ctc) in case state.pot already
-            # includes the current bet; clamp to 1 to avoid division by zero.
             if ctc > 0 and pot > 0:
                 pre_bet_pot = max(1, pot - ctc)
                 bet_to_pre_pot = ctc / pre_bet_pot
@@ -1988,7 +2006,7 @@ class Player(BaseBot):
         if s not in ('flop', 'turn', 'river'):
             return
 
-        if state.cost_to_call > 0:
+        if state.cost_to_call > BIG_BLIND:
             self._opp_bet_streets.add(s)
         self._streets_seen.add(s)
 
@@ -2015,8 +2033,8 @@ class Player(BaseBot):
             self._we_won_auction = True
             self._revealed_card  = opp_revealed[0]
             amount_paid = 0
-            if self._chips_before_auction is not None and self._our_auction_bid > 0:
-                amount_paid = self._chips_before_auction - state.my_chips
+            if self._chips_before_auc is not None and self._our_auction_bid > 0:
+                amount_paid = self._chips_before_auc - state.my_chips
             if amount_paid == self._our_auction_bid:
                 self._opp_won_auction = True
             else: self._opp_won_auction = False
@@ -2088,10 +2106,14 @@ class Player(BaseBot):
         self._observe_postflop(current_state)
         self._observe_reraises(current_state)
 
-        opp_rf = self.opp_model.inferred_range_fraction()
+        opp_rf = self.opp_model.inferred_range_fraction(
+            street              = current_state.street,
+            opp_bet_this_street = current_state.cost_to_call > BIG_BLIND,
+            opp_won_auction     = self._opp_won_auction,
+        )
 
         if current_state.street == 'auction':
-            self._chips_before_auction = current_state.my_chips
+            self._chips_before_auc = current_state.my_chips
             bid = compute_bid(current_state, self.strategy, opp_rf)
             self._our_auction_bid = bid
             return ActionBid(bid)

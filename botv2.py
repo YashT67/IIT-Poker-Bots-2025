@@ -12,7 +12,7 @@ This bot plays heads-up (2-player) poker. It uses:
 
 Entry point: `Player.get_move()` is called each time the bot must act.
 """
-
+import numpy as np
 import random
 import math
 import eval7
@@ -68,10 +68,15 @@ REVEALED_LOW_EQ_DELTA    = 0.02
 REVEALED_LOW_BLUFF_SCALE = 1.10
 REVEALED_LOW_SIZE_SCALE  = 1.15
 
+REVEALED_MID_EQ_DELTA    = -0.02
+REVEALED_MID_BLUFF_SCALE = 0.80
+REVEALED_MID_SIZE_SCALE  = 0.90
+
 BID_CAP_MIN = 0.25
-BID_CAP_MAX = 0.64
+BID_CAP_MAX = 0.75
 
 AUCTION_LOSS_K = 0.80
+AUCTION_WIN_K  = 1.10
 
 AUCTION_CONFIDENCE_MIN = 16
 
@@ -89,7 +94,7 @@ POSITION_BB_CALL_BONUS  =  0.03
 CHECK_RAISE_FREQ    = 0.28
 CHECK_RAISE_MIN_AGG = 0.40
 
-RIVER_VALUE_SIZE      = 0.85
+RIVER_VALUE_SIZE      = 0.80
 RIVER_BLUFF_REDUCTION = 0.60
 
 def _sigmoid(x, mid, steepness=12.0):
@@ -427,6 +432,8 @@ def monte_carlo_equity(hole: list, board: list, opp_known: list,
     cards_needed_opp   = 2 - len(opp_known)
 
     range_pairs = build_opponent_range(opp_range_fraction, known_set)
+    if not range_pairs:
+        range_pairs = build_opponent_range(RANGE_LOOSE, known_set)
     second_card_pool = None
     if cards_needed_opp == 1:
         known_card = opp_known[0]
@@ -436,6 +443,8 @@ def monte_carlo_equity(hole: list, board: list, opp_known: list,
                 for c in pair
                 if c != known_card and c not in known_set
             })
+        if not second_card_pool:
+            second_card_pool = [c for c in remaining if c != known_card]
 
     e7_hole = [_e7(c) for c in hole]
     e7_board = [_e7(c) for c in board]
@@ -819,7 +828,7 @@ class OpponentModel:
         Fraction of auction phases where our bot won and received a card reveal.
         Starts at 0.4 (bet more aggressively) before any auctions are seen.
         """
-        return self.ema_won_auction if self.auction_rounds > 8 else 0.4
+        return self.ema_won_auction if self.ema_won_auction is not None else 0.4
 
     @property
     def opp_post_auction_bet_rate(self) -> float:
@@ -869,38 +878,62 @@ class OpponentModel:
     # ---- Archetype classifiers ----
 
     def is_tight(self)      -> bool: return self.recent_vpip < 0.30
-    def is_loose(self)      -> bool: return self.recent_vpip > 0.70
+    def is_loose(self)      -> bool: return self.recent_vpip > 0.60
     def is_aggressive(self) -> bool: return self.postflop_aggression > 0.50
     def is_passive(self)    -> bool: return self.postflop_aggression < 0.30
     def is_folder(self)     -> bool: return self.recent_fold_rate > 0.30
     def sufficient_data(self) -> bool: return self.hands_seen >= MODEL_MIN_HANDS
 
-    def inferred_range_fraction(self) -> float:
+    def inferred_range_fraction(self, street: str = 'pre-flop',
+                                opp_bet_this_street: bool = False,
+                                opp_won_auction: bool = False) -> float:
         """
         Translate the opponent's observed play style into a range fraction
         used to constrain Monte Carlo opponent hand sampling.
+        Pre-flop: uses VPIP tightness only, same as before.
+        Post-flop: multiplies the preflop base by a narrowing factor that
+        reflects how each street of action eliminates weak hands from the
+        opponent's continuing range.
+        Narrowing sources:
+          - Street depth: flop=0.85, turn=0.72, river=0.60 of the base.
+          - Opponent bet this street: further ×0.80 (betting = stronger range).
+          - Postflop aggression profile:
+              aggressive opponents bet wide → less narrowing (×1.12 cap 1.0).
+              passive opponents only bet strong → more narrowing (×0.88).
         Returns:
-            RANGE_TIGHT  (0.30) if opponent plays few hands (tight).
-            RANGE_LOOSE  (0.96) if opponent plays many hands (loose) OR
-                                 if we don't yet have enough data to trust the model.
-            RANGE_MEDIUM (0.60) for everything in between.
+            Float range fraction in [0.10, RANGE_LOOSE].
+            RANGE_TIGHT  (0.30) / RANGE_MEDIUM (0.60) / RANGE_LOOSE (0.96)
+            as the preflop base, then scaled down post-flop.
         """
         if not self.sufficient_data():
-            return RANGE_LOOSE
+            base = RANGE_LOOSE * RANGE_LOOSE
+        elif self.is_tight():
+            base = RANGE_TIGHT
+        elif self.is_loose():
+            base = RANGE_LOOSE
+        else:
+            base = RANGE_MEDIUM
+        if street in ('pre-flop', 'auction'):
+            return base
+        else: base = min(base*1.10, RANGE_LOOSE)
 
-        if self.is_tight():
-            return RANGE_TIGHT
-        if self.is_loose():
-            return RANGE_LOOSE
-        return RANGE_MEDIUM
+        street_factor = {'flop': 0.90, 'turn': 0.81, 'river': 0.72}.get(street, 1.0)
+        if opp_won_auction:
+            street_factor *= 0.80
+        elif opp_bet_this_street:
+            street_factor *= 0.90
 
-    def __str__(self):
-        """Debug-friendly string showing key model statistics."""
-        return (f'Hands={self.hands_seen}  VPIP={self.ema_vpip:.2f}  '
-                f'PF_agg={self.postflop_aggression:.2f}  '
-                f'Fold%={self.fold_rate:.2f}  '
-                f'AuctWin%={self.our_auction_win_rate:.2f}  '
-                f'OppPostAuctBet%={self.opp_post_auction_bet_rate:.2f}')
+        if self.our_auction_win_rate > 0.8:
+            street_factor *= 0.90
+
+        if self.sufficient_data():
+            if self.is_aggressive():
+                street_factor = min(street_factor * 1.20, 1.0)
+            elif self.is_passive():
+                street_factor *= 0.90
+
+        street_factor = min(street_factor, 0.90)
+        return max(0.16, base * street_factor)
 
 # =============================================================================
 # SECTION 10: ADAPTIVE STRATEGY ENGINE
@@ -970,7 +1003,7 @@ class AdaptiveStrategy:
         vpip = m.recent_vpip
         agg  = m.postflop_aggression
 
-        tightness  = _sigmoid(vpip, 0.5)
+        tightness  = _sigmoid(vpip, 0.45)
         aggression = _sigmoid(agg,  0.4)
 
         w_tp = (1.0 - tightness) * (1.0 - aggression)   # tight-passive
@@ -1066,27 +1099,24 @@ class AdaptiveStrategy:
     def bid_multiplier(self) -> float:
         """
         Scale our raw computed auction bid based on our recent auction win rate.
-        If we are losing too many auctions (win rate < 25%), bid higher to
+        If we are losing too many auctions, bid higher to
         compete more aggressively and gain more information.
-        If we are winning almost all auctions (win rate > 75%), bid lower
+        If we are winning almost all auctions, bid lower
         to avoid overpaying for information we tend to get anyway.
         Returns:
             Float multiplier applied to the raw computed bid amount.
         """
         m = self.model
 
-        if m.auction_rounds < 15:
-            return 1.0
-
         wr = m.our_auction_win_rate
+        bm_delta = 0.0
+        dampen=min(1.0, m.auction_rounds / 16.0)
 
-        if wr < 0.10: return 2.50
-        elif wr < 0.20: return 2.00
-        elif wr < 0.30: return 1.6
-        elif wr < 0.40: return 1.4
-        elif wr > 0.8: return 0.70
-        elif wr > 0.6: return 0.90
-        return 1.10
+        xp = [0.00, 0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 1.00]
+        yp = [3.00, 2.20, 1.70, 1.10, 0.60, 0.30, 0.10, 0.40]
+
+        bm_delta = float(np.interp(wr, xp, yp))
+        return 1.0 + bm_delta * dampen
 
     def describe(self) -> str:
         """
@@ -1133,7 +1163,7 @@ _STREET_SIZING = {
 }
 
 
-def street_sizing(street: str, texture: BoardTexture, strong: int) -> float:
+def street_sizing(street: str, texture: BoardTexture, strong: float) -> float:
     """
     Determine the appropriate bet sizing fraction for the current street and
     board texture.
@@ -1267,7 +1297,7 @@ def is_drawing_hand(hole: list, board: list, texture: BoardTexture) -> bool:
 # cautiously. Low card → opponent's hand is weaker; exploit accordingly.
 # =============================================================================
 
-def revealed_card_adjustment(revealed_card: str, board: list, auctions_won: int = 0) -> tuple:
+def revealed_card_adjustment(revealed_card: str, board: list, auctions_won: float = 0) -> tuple:
     """
     Compute equity, bluff, and sizing adjustments based on the rank of the
     opponent's card that was revealed through winning the auction.
@@ -1296,22 +1326,45 @@ def revealed_card_adjustment(revealed_card: str, board: list, auctions_won: int 
     board_ranks = [card_rank(c) for c in board]
 
     connects_to_board = any(abs(rank - br) <= 2 for br in board_ranks)
+    paired_to_board = any(rank == br for br in board_ranks)
 
-    confidence = min(1.0, auctions_won / AUCTION_CONFIDENCE_MIN)
+    confidence = min(1.0 - auctions_won, 0.84)
+    confidence = max(confidence, 0.16)
 
     if rank >= REVEALED_HIGH_RANK:
-        eq_d  = REVEALED_HIGH_EQ_DELTA    * confidence
-        bl_sc = 1.0 + (REVEALED_HIGH_BLUFF_SCALE - 1.0) * confidence
-        sz_sc = 1.0 + (REVEALED_HIGH_SIZE_SCALE  - 1.0) * confidence
+        dampen = 1.0
+        if connects_to_board:
+            dampen *= 1.1
+        if paired_to_board:
+            dampen *= 1.3
+        eq_d  = REVEALED_HIGH_EQ_DELTA * confidence * dampen
+        bl_sc = 1.0 + (REVEALED_HIGH_BLUFF_SCALE - 1.0) * confidence * dampen
+        sz_sc = 1.0 + (REVEALED_HIGH_SIZE_SCALE  - 1.0) * confidence * dampen
         return (eq_d, bl_sc, sz_sc)
 
     elif rank <= REVEALED_LOW_RANK:
-        dampen = 0.6 if connects_to_board else 1.0
+        dampen = 1.0
+        if connects_to_board:
+            dampen *= 0.7
+        if paired_to_board:
+            dampen *= 0.5
         eq_d  = REVEALED_LOW_EQ_DELTA * dampen * confidence
         bl_sc = 1.0 + (REVEALED_LOW_BLUFF_SCALE - 1.0) * dampen * confidence
         sz_sc = 1.0 + (REVEALED_LOW_SIZE_SCALE  - 1.0) * dampen * confidence
         return (eq_d, bl_sc, sz_sc)
 
+    elif paired_to_board:
+        eq_d  = REVEALED_MID_EQ_DELTA
+        bl_sc = REVEALED_MID_BLUFF_SCALE
+        sz_sc = REVEALED_MID_SIZE_SCALE
+        return (eq_d, bl_sc, sz_sc)
+    
+    elif connects_to_board:
+        eq_d  = REVEALED_MID_EQ_DELTA * confidence
+        bl_sc = 1.0 + (REVEALED_MID_BLUFF_SCALE - 1.0) * confidence
+        sz_sc = 1.0 + (REVEALED_MID_SIZE_SCALE  - 1.0) * confidence
+        return (eq_d, bl_sc, sz_sc)
+    
     return (0.0, 1.0, 1.0)
 
 # =============================================================================
@@ -1410,7 +1463,7 @@ def _batched_auction_equity(hole: list, board: list,
     range_pairs = build_opponent_range(opp_range_fraction, excluded)
 
     if not range_pairs:
-        range_pairs = [(a, b) for a in remaining for b in remaining if a < b]
+        range_pairs = build_opponent_range(RANGE_LOOSE, excluded)
 
     tighter_frac = _dynamic_lose_frac(opp_range_fraction, strategy)
     tighter_pairs = build_opponent_range(tighter_frac, excluded)
@@ -1504,9 +1557,6 @@ def compute_bid(state: PokerState,
                                 n_sims=MC_SIMS_AUCTION,
                                 opp_range_fraction=opp_range_fraction)
 
-    if equity >= 0.80 or equity <= 0.20:
-        return BIG_BLIND
-
     excluded = set(hole + board + opp)
 
     eq_win, eq_lose = _batched_auction_equity(hole, board, excluded,
@@ -1535,6 +1585,10 @@ def compute_bid(state: PokerState,
     bid          = int(raw_bid)
 
     final_bid = min(bid, max_bid)
+    if random.random() < 0.04:
+        bluff_bid = int(0.08 * (state.pot + state.my_chips))
+        final_bid = max(final_bid, bluff_bid)
+
     noise = 1.0 + random.uniform(-0.04,0.04)
     final_bid = int(final_bid * noise)
     return min(final_bid, state.my_chips)
@@ -1575,7 +1629,7 @@ def estimate_shove_range(opp_model) -> float:
         return 0.16
 
     base_frac = opp_model.inferred_range_fraction() * 0.40
-    if opp_model.preflop_aggression_rate < 0.30:
+    if opp_model.recent_vpip < 0.30:
         base_frac *= 0.70
 
     return max(0.08, min(0.16, base_frac))
@@ -1619,7 +1673,7 @@ def decide_action(state: PokerState, equity: float,
     
     if street_reraise_count > 0:
         value_t = min(0.90, value_t * (1.0 + 0.1 * street_reraise_count))
-        call_t = min(0.80, call_t  * (1.0 + 0.04 * street_reraise_count))
+        call_t = min(0.80, call_t  * (1.0 + 0.06 * street_reraise_count))
 
     if opp_won_auction:
         bluff_f *= AUCTION_LOSS_K
@@ -1628,14 +1682,21 @@ def decide_action(state: PokerState, equity: float,
         value_t = 1.0 - AUCTION_LOSS_K * (1.0 - value_t)
 
         fold_t = min(fold_t, call_t - 0.06)
+    else:
+        bluff_f *= AUCTION_WIN_K
 
     pot = state.pot
     ctc = state.cost_to_call
     hole = list(state.my_hand)
 
-    pot_odds = ctc / (pot + ctc) if (ctc > 0 and pot + ctc > 0) else 0.0
+    if opp_won_auction and ctc > max(BIG_BLIND, pot * 0.16):
+        call_t += 0.02
+        value_t += 0.02
 
-    min_raise, max_raise = state.raise_bounds
+    pot_odds = ctc / (pot + ctc) if (ctc > 0 and pot + ctc > 0) else 0.0
+    pot_odds = min(pot_odds, 0.70)
+
+    min_raise, max_raise = state.raise_bounds if state.raise_bounds else (0, 0)
 
     def clamp(amount: int, jitter: float = 0.04) -> int:
         """
@@ -1644,7 +1705,7 @@ def decide_action(state: PokerState, equity: float,
         """
         noise = 1.0 + random.uniform(-jitter, jitter)
         jittered = int(amount * noise)
-        return max(min_raise, min(jittered, max_raise))
+        return min(max(jittered, min_raise), max_raise)
 
 
     spr = compute_spr(state)
@@ -1703,13 +1764,22 @@ def decide_action(state: PokerState, equity: float,
     if is_draw and not strong:
         sz_frac *= 0.80
     elif not is_draw and strong and texture.wetness > 0.35:
-        sz_frac *= 1.15
+        sz_frac *= 1.10
 
-    sz_frac = max(0.25, min(1.40, sz_frac))
+    sz_frac = max(0.20, min(1.20, sz_frac))
+
+    if state.can_act(ActionCheck):
+        temp_sz = (RIVER_VALUE_SIZE * rev_size_sc) if street == 'river' else sz_frac
+        proposed_raise = pot + int(pot * temp_sz)
+    else:
+        proposed_raise = int((pot + ctc) * 0.80)
+
+    if proposed_raise > state.my_chips * 0.70:
+        value_t += 0.02
 
     if spr < SPR_LOW and street != 'pre-flop':
-        if eff_eq >= 0.60:
-            if eff_eq < 0.64 and state.can_act(ActionCall):
+        if eff_eq >= 0.64:
+            if eff_eq < 0.72 and state.can_act(ActionCall):
                 return ActionCall()
             elif state.can_act(ActionRaise):
                 return ActionRaise(max_raise)
@@ -1786,10 +1856,6 @@ def decide_action(state: PokerState, equity: float,
             else:
                 call_t_river = call_t
 
-            # Overbet alarm: when the bet is a large multiple of the pre-bet pot,
-            # the opponent's range is heavily polarized toward nut hands.
-            # Recover pre-bet pot as (state.pot - ctc) in case state.pot already
-            # includes the current bet; clamp to 1 to avoid division by zero.
             if ctc > 0 and pot > 0:
                 pre_bet_pot = max(1, pot - ctc)
                 bet_to_pre_pot = ctc / pre_bet_pot
@@ -1941,7 +2007,7 @@ class Player(BaseBot):
         if self._pf_recorded or state.street != 'pre-flop':
             return
 
-        was_aggressive = state.cost_to_call > (BIG_BLIND - SMALL_BLIND)
+        was_aggressive = state.cost_to_call > BIG_BLIND
         self.opp_model.record_preflop(was_aggressive)
         self._pf_recorded = True
 
@@ -1958,7 +2024,7 @@ class Player(BaseBot):
         if s not in ('flop', 'turn', 'river'):
             return
 
-        if state.cost_to_call > 0:
+        if state.cost_to_call > BIG_BLIND:
             self._opp_bet_streets.add(s)
         self._streets_seen.add(s)
 
@@ -1985,9 +2051,9 @@ class Player(BaseBot):
             self._we_won_auction = True
             self._revealed_card  = opp_revealed[0]
             amount_paid = 0
-            if self._chips_before_auction is not None and self._our_auction_bid > 0:
-                amount_paid = self._chips_before_auction - state.my_chips
-            if amount_paid > 0:
+            if self._chips_before_auc is not None and self._our_auction_bid > 0:
+                amount_paid = self._chips_before_auc - state.my_chips
+            if amount_paid == self._our_auction_bid:
                 self._opp_won_auction = True
             else: self._opp_won_auction = False
 
@@ -2058,10 +2124,14 @@ class Player(BaseBot):
         self._observe_postflop(current_state)
         self._observe_reraises(current_state)
 
-        opp_rf = self.opp_model.inferred_range_fraction()
+        opp_rf = self.opp_model.inferred_range_fraction(
+            street              = current_state.street,
+            opp_bet_this_street = current_state.cost_to_call > BIG_BLIND,
+            opp_won_auction     = self._opp_won_auction,
+        )
 
         if current_state.street == 'auction':
-            self._chips_before_auction = current_state.my_chips
+            self._chips_before_auc = current_state.my_chips
             bid = compute_bid(current_state, self.strategy, opp_rf)
             self._our_auction_bid = bid
             return ActionBid(bid)

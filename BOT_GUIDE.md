@@ -184,19 +184,6 @@ game_info.time_bank     # the total number of seconds your bot has left to play 
 
 ------------------------------------------------------------------------
 
-# Tracking Opponent Behavior
-
-You may want to write a bot that adapts to opponent's play style. For this purpose, you can track your opponent's behaviour. You can store class variables, for example,
-
-``` python
-self.opp_fold_count     # number of times opponent folded
-self.opp_raise_count    # number of times opponent raised
-```
-
-and update them in `on_hand_end()` to adapt dynamically.
-
-------------------------------------------------------------------------
-
 # Logs
 
 You can add `print` statements in your bot code for debugging. The printed lines appear in `<GAME_LOG_FOLDER>/<BOT_NAME>.plog`. GAME_LOG_FOLDER and BOT_NAME are to be specified in `config.py`.

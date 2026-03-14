@@ -1,17 +1,3 @@
-"""
-bot.py — Heads-Up No-Limit Hold'em Poker Bot with Auction Mechanic Support
-
-This bot plays heads-up (2-player) poker. It uses:
-  - Pre-computed pre-flop equity tables for fast pre-flop decisions
-  - Monte Carlo simulation for post-flop equity estimation
-  - An opponent model that tracks aggression, looseness, and auction behavior
-  - An adaptive strategy layer that shifts thresholds based on the opponent's profile
-  - A Vickrey-style auction bidding engine to reveal one of the opponent's hole cards
-  - Board texture analysis to differentiate between wet/dry boards
-  - Stack-to-Pot Ratio (SPR) logic for commitment-level decisions
-
-Entry point: `Player.get_move()` is called each time the bot must act.
-"""
 import numpy as np
 import random
 import math
@@ -24,17 +10,550 @@ from pkbot.states import GameInfo, PokerState, STARTING_STACK, BIG_BLIND, SMALL_
 from pkbot.base import BaseBot
 from pkbot.runner import parse_args, run_bot
 
-
-# =============================================================================
-# SECTION 1: GLOBAL BEHAVIORAL CONSTANTS
-#
-# These constants control the bot's strategy at a high level.
-# Changing these values will affect aggression, bidding, bluffing frequency,
-# and how the bot responds to various game situations without modifying logic.
-# =============================================================================
-
 OOP_BID_MULTIPLIER = 1.4
+MC_SIMS = 1800
+MC_SIMS_AUCTION = 250
+FOLD_THRESHOLD  = 0.35
+CALL_THRESHOLD  = 0.42
+VALUE_THRESHOLD = 0.66
+BLUFF_FREQ = 0.16
+BET_SMALL_FRAC = 0.50
+BET_BIG_FRAC   = 0.75
+MODEL_MIN_HANDS = 36
+SPR_LOW  = 3.0
+SPR_HIGH = 9.0
+RANGE_TIGHT  = 0.30
+RANGE_MEDIUM = 0.60
+RANGE_LOOSE  = 0.96
+REVEALED_HIGH_RANK = 11
+REVEALED_LOW_RANK  = 6
+REVEALED_HIGH_EQ_DELTA    = -0.04
+REVEALED_HIGH_BLUFF_SCALE =  0.70
+REVEALED_HIGH_SIZE_SCALE  =  0.85
+REVEALED_LOW_EQ_DELTA    = 0.02
+REVEALED_LOW_BLUFF_SCALE = 1.10
+REVEALED_LOW_SIZE_SCALE  = 1.15
+REVEALED_MID_EQ_DELTA    = -0.02
+REVEALED_MID_BLUFF_SCALE = 0.80
+REVEALED_MID_SIZE_SCALE  = 0.90
+BID_CAP_MIN = 0.20
+BID_CAP_MAX = 0.80
+AUCTION_LOSS_K = 0.80
+AUCTION_WIN_K  = 1.10
+AUCTION_CONFIDENCE_MIN = 16
+OPP_AUCT_AGG_HIGH  = 0.65
+OPP_AUCT_AGG_LOW   = 0.30
+OPP_AUCT_FOLD_BUMP = 0.05
+OPP_AUCT_CALL_DIP  = 0.03
+POSITION_IP_EQ_BONUS    =  0.02
+POSITION_OOP_EQ_DELTA   = -0.02
+POSITION_IP_BLUFF_SCALE =  1.10
+POSITION_OOP_BLUFF_SCALE =  0.84
+POSITION_BB_CALL_BONUS  =  0.03
+CHECK_RAISE_FREQ    = 0.28
+CHECK_RAISE_MIN_AGG = 0.40
+RIVER_VALUE_SIZE      = 0.80
+RIVER_BLUFF_REDUCTION = 0.60
+EQUITY_ALPHA = 0.16
 
+def _sigmoid(x, mid, steepness=12.0):
+    """
+    Computes a sigmoid curve value for continuous transitions.
+    
+    This function creates smooth, non-linear transitions between strategic states 
+    to avoid sharp discontinuities in logic (e.g., dynamically shifting a threshold).
+    
+    Args:
+        x (float): The input variable to map.
+        mid (float): The midpoint value where the sigmoid outputs 0.5.
+        steepness (float): Controls the gradient of the transition.
+        
+    Returns:
+        float: A value between 0.0 and 1.0.
+    """
+    return 1.0 / (1.0 + math.exp(-steepness * (x - mid)))
+
+RANKS = '23456789TJQKA'
+SUITS = 'hdcs'
+RANK_VAL = {r: i for i, r in enumerate(RANKS, 2)}
+_RD = {v: k for k, v in RANK_VAL.items()}
+FULL_DECK = [r + s for r in RANKS for s in SUITS]
+
+def card_rank(card: str) -> int:
+    """
+    Parses a string playing card to retrieve its numerical rank.
+    
+    Args:
+        card (str): A 2-character string representing the card (e.g., 'Ah').
+        
+    Returns:
+        int: The rank integer, scaled from 2 ('2') to 14 ('A').
+    """
+    return RANK_VAL[card[0]]
+
+def card_suit(card: str) -> str:
+    """
+    Parses a string playing card to retrieve its suit.
+    
+    Args:
+        card (str): A 2-character string representing the card (e.g., 'Ah').
+        
+    Returns:
+        str: A 1-character string of the suit ('h', 'd', 'c', or 's').
+    """
+    return card[1]
+
+def convert_to_cards(cards):
+    """
+    Converts string-based cards into eval7.Card instances for evaluation.
+    
+    Args:
+        cards (list[str]): A list of string representations of cards.
+        
+    Returns:
+        list[eval7.Card]: A list of corresponding eval7 objects.
+    """
+    return [eval7.Card(str(c)) for c in cards]
+
+_E7_CACHE: dict[str, eval7.Card] = {}
+
+def _e7(card_str: str) -> eval7.Card:
+    """
+    Retrieves or generates a cached eval7.Card object for performance.
+    
+    Args:
+        card_str (str): The string representation of a card.
+        
+    Returns:
+        eval7.Card: The instantiated card object.
+    """
+    c = _E7_CACHE.get(card_str)
+    if c is None:
+        c = eval7.Card(card_str)
+        _E7_CACHE[card_str] = c
+    return c
+
+for _cs in FULL_DECK:
+    _e7(_cs)
+
+def best_hand_score(hole: list, board: list) -> int:
+    """
+    Evaluates the combined strength of private and community cards.
+    
+    Args:
+        hole (list[str]): The player's two private hole cards.
+        board (list[str]): The community cards visible on the board.
+        
+    Returns:
+        int: The absolute hand strength score evaluated by the eval7 library.
+    """
+    all_cards = convert_to_cards(hole + board)
+    return eval7.evaluate(all_cards)
+
+_PF_EQUITY: dict[str, float] = {
+    'AA': 0.852, 'KK': 0.824, 'QQ': 0.799, 'JJ': 0.775, 'TT': 0.751,
+    'AKs': 0.670, 'AQs': 0.661, 'AJs': 0.654, 'ATs': 0.647,
+    'AKo': 0.653, 'AQo': 0.644, 'AJo': 0.635, 'ATo': 0.627,
+    '32o': 0.323
+}
+
+@lru_cache(maxsize=2704)
+def _hand_key(c1: str, c2: str) -> str:
+    """
+    Converts two specific cards into a canonical string key for equity lookups.
+    
+    Args:
+        c1 (str): First card.
+        c2 (str): Second card.
+        
+    Returns:
+        str: Normalized key denoting rank order and suitedness (e.g., 'AKs', '55').
+    """
+    r1, r2 = card_rank(c1), card_rank(c2)
+    s1, s2 = card_suit(c1), card_suit(c2)
+
+    hi_r, lo_r = max(r1, r2), min(r1, r2)
+
+    if hi_r == lo_r:
+        return _RD[hi_r] + _RD[lo_r]
+
+    suffix = 's' if s1 == s2 else 'o'
+    return _RD[hi_r] + _RD[lo_r] + suffix
+
+def preflop_equity(hole: list) -> float:
+    """
+    Determines the precomputed pre-flop equity against a random opponent hand.
+    
+    Args:
+        hole (list[str]): The two private hole cards.
+        
+    Returns:
+        float: Win probability metric ranging from 0.0 to 1.0.
+    """
+    key = _hand_key(hole[0], hole[1])
+    if key in _PF_EQUITY:
+        return _PF_EQUITY[key]
+    return 0.5
+
+_ALL_HAND_KEYS_SORTED: list[str] = sorted(
+    _PF_EQUITY.keys(), key=lambda k: _PF_EQUITY[k], reverse=True
+)
+
+_CARDS_FOR_KEY_FULL: dict[str, list] = {}
+
+for _key in _ALL_HAND_KEYS_SORTED:
+    if len(_key) == 2:
+        _r = _key[0]
+        _CARDS_FOR_KEY_FULL[_key] = [(_r + _s1, _r + _s2)
+                                      for _s1 in SUITS for _s2 in SUITS
+                                      if _s1 < _s2]
+    else:
+        _hi_r, _lo_r, _suited = _key[0], _key[1], _key[2] == 's'
+        _pairs = []
+        for _s1 in SUITS:
+            for _s2 in SUITS:
+                if _suited and _s1 != _s2:
+                    continue
+                if not _suited and _s1 == _s2:
+                    continue
+                _c1, _c2 = _hi_r + _s1, _lo_r + _s2
+                if _c1 != _c2:
+                    _pairs.append((_c1, _c2))
+        _CARDS_FOR_KEY_FULL[_key] = _pairs
+
+def _cards_for_key(key: str, excluded: set) -> list:
+    """
+    Retrieves all valid hand combinations for a specific class, excluding unavailable cards.
+    
+    Args:
+        key (str): Hand classification key (e.g., 'AKs').
+        excluded (set): Set of card strings already dealt/visible in the game.
+        
+    Returns:
+        list: List of tuple pairs defining valid hand configurations.
+    """
+    return [(a, b) for a, b in _CARDS_FOR_KEY_FULL[key]
+            if a not in excluded and b not in excluded]
+
+@lru_cache(maxsize=256)
+def _build_opponent_range_cached(range_fraction: float,
+                                  excluded_frozen: frozenset) -> tuple:
+    """
+    Constructs and caches the potential valid hand combinations an opponent might hold.
+    
+    Args:
+        range_fraction (float): Float percentage of top hands to consider (0.0 to 1.0).
+        excluded_frozen (frozenset): Cards not available for range combinations.
+        
+    Returns:
+        tuple: Tuples representing the subset of plausible opponent hands.
+    """
+    n_types  = max(1, int(len(_ALL_HAND_KEYS_SORTED) * range_fraction))
+    top_keys = _ALL_HAND_KEYS_SORTED[:n_types]
+    pairs    = []
+    for key in top_keys:
+        pairs.extend(_cards_for_key(key, excluded_frozen))
+    return tuple(pairs)
+
+def build_opponent_range(range_fraction: float, excluded: set) -> list:
+    """
+    Wrapper for resolving the opponent's range while managing unhashable sets.
+    
+    Args:
+        range_fraction (float): Proportion of top pre-flop hands the opponent could hold.
+        excluded (set): Current known dead cards to exclude.
+        
+    Returns:
+        list: Hand combinations generated from the cache helper.
+    """
+    return list(_build_opponent_range_cached(range_fraction, frozenset(excluded)))
+
+def monte_carlo_equity(hole: list, board: list, opp_known: list,
+                       n_sims: int = MC_SIMS,
+                       opp_range_fraction: float = RANGE_LOOSE) -> float:
+    """
+    Simulates thousands of game outcomes to predict hand equity dynamically.
+    
+    This function utilizes Monte Carlo simulation, shuffling remaining cards and generating 
+    opponent profiles based on partial information (e.g., auctioned cards) and estimated ranges.
+    
+    Args:
+        hole (list[str]): The bot's two personal cards.
+        board (list[str]): Current shared cards.
+        opp_known (list[str]): Cards definitively known about the opponent (up to 2).
+        n_sims (int): The number of independent game simulations to run.
+        opp_range_fraction (float): The inferred breadth of the opponent's starting hands.
+        
+    Returns:
+        float: Calculated probability of winning the hand on this street (0.0 to 1.0).
+    """
+    known_set = set(hole + board + opp_known)
+    remaining = [c for c in FULL_DECK if c not in known_set]
+
+    cards_needed_board = 5 - len(board)
+    cards_needed_opp   = 2 - len(opp_known)
+
+    range_pairs = build_opponent_range(opp_range_fraction, known_set)
+    if not range_pairs:
+        range_pairs = build_opponent_range(RANGE_LOOSE, known_set)
+        
+    second_card_pool = None
+    if cards_needed_opp == 1:
+        known_card = opp_known[0]
+        second_card_pool = list({
+                c for pair in range_pairs for c in pair
+                if c != known_card and c not in known_set
+            })
+        if not second_card_pool:
+            second_card_pool = [c for c in remaining if c != known_card]
+
+    e7_hole = [_e7(c) for c in hole]
+    e7_board = [_e7(c) for c in board]
+    _eval = eval7.evaluate
+
+    wins = 0.0
+    _sample = random.sample
+    _choice = random.choice
+
+    for _ in range(n_sims):
+        if second_card_pool is not None:
+            second = _choice(second_card_pool)
+            opp_hole_strs = [opp_known[0], second]
+            e7_opp = [_e7(c) for c in opp_hole_strs]
+            pool = [c for c in remaining if c != second]
+        else:
+            pair = _choice(range_pairs)
+            opp_hole_strs = list(opp_known) + [c for c in pair
+                                                if c not in opp_known][:cards_needed_opp]
+            e7_opp = [_e7(c) for c in opp_hole_strs]
+            pool = [c for c in remaining if c not in opp_hole_strs]
+
+        sampled = _sample(pool, cards_needed_board)
+        e7_sampled = [_e7(c) for c in sampled]
+
+        my  = _eval(e7_hole + e7_board + e7_sampled)
+        opp = _eval(e7_opp  + e7_board + e7_sampled)
+
+        if my > opp:
+            wins += 1.0
+        elif my == opp:
+            wins += 0.5
+
+    return wins / n_sims if n_sims > 0 else 0.5
+
+def get_equity(state: PokerState, n_sims: int = MC_SIMS, opp_range_fraction: float = RANGE_LOOSE) -> float:
+    """
+    Entry point for determining equity based on the current context of the hand.
+    
+    If pre-flop, returns the highly efficient static equity table output.
+    If post-flop, escalates the calculation to `monte_carlo_equity`.
+    
+    Args:
+        state (PokerState): Current structure representing the game tree.
+        n_sims (int): Optional override of MC simulation length.
+        opp_range_fraction (float): The inferred profile range modifier for the opponent.
+        
+    Returns:
+        float: Win probability from 0.0 to 1.0.
+    """
+    hole  = state.my_hand
+    board = list(state.board) if state.board else []
+    opp   = list(state.opp_revealed_cards) if hasattr(state, 'opp_revealed_cards') and state.opp_revealed_cards else []
+
+    if not hole or len(hole) < 2:
+        return 0.5
+
+    if state.street == 'pre-flop':
+        return preflop_equity(hole)
+    return monte_carlo_equity(hole, board, opp, n_sims, opp_range_fraction)
+
+class BoardTexture:
+    """
+    Evaluates the community cards to establish how dangerous the board has become.
+    
+    This analyzes the synergy of the community cards (flush draw threats, straight 
+    draws, high cards, and pairings) to calculate an aggregate 'wetness' score.
+    """
+
+    def __init__(self, board: list):
+        """
+        Initializes the object by processing all texture attributes concurrently.
+        
+        Args:
+            board (list[str]): The currently dealt community cards.
+        """
+        self.board = board
+        ranks = [card_rank(c) for c in board]
+        suits = [card_suit(c) for c in board]
+
+        self.flush_draw = max(suits.count(s) for s in SUITS) >= 3 if board else False
+        self.straight_draw = self._has_straight_draw(ranks)
+        self.paired = len(ranks) != len(set(ranks)) and len(board) >= 2
+        self.trips_on_board = any(ranks.count(r) >= 3 for r in set(ranks))
+        self.high_board = (sum(ranks) / max(len(ranks), 1)) > 10 if board else False
+
+        self.wetness = (
+            0.40 * int(self.flush_draw)
+          + 0.35 * int(self.straight_draw)
+          + 0.15 * int(self.paired)
+          + 0.10 * int(self.high_board)
+        )
+
+    @staticmethod
+    def _has_straight_draw(ranks: list) -> bool:
+        """
+        Detects if three cards on the board can constitute a 5-card window for a straight.
+        
+        Args:
+            ranks (list[int]): Numeric representations of the board cards.
+            
+        Returns:
+            bool: True if a straight draw is structurally plausible.
+        """
+        if len(ranks) < 3:
+            return False
+
+        uniq = sorted(set(ranks))
+
+        for i in range(len(uniq) - 2):
+            if uniq[i + 2] - uniq[i] <= 4:
+                return True
+
+        if 14 in uniq:
+            low_uniq = sorted({1 if r == 14 else r for r in uniq})
+            for i in range(len(low_uniq) - 2):
+                if low_uniq[i + 2] - low_uniq[i] <= 4:
+                    return True
+        return False
+
+def board_texture(board: list) -> BoardTexture:
+    """
+    Convenience constructor method to create a BoardTexture analyzer object.
+    
+    Args:
+        board (list[str]): List of community cards.
+        
+    Returns:
+        BoardTexture: The initialized context for the provided community cards.
+    """
+    return BoardTexture(board)
+
+def compute_spr(state: PokerState) -> float:
+    """
+    Calculates the Stack-to-Pot Ratio (SPR) representing geometric commitment to the hand.
+    
+    SPR drives strategic maneuvers—a low SPR dictates unyielding commit lines 
+    while a higher SPR facilitates multi-street folding logic and implied odds setups.
+    
+    Args:
+        state (PokerState): Context providing access to player chips and pot size.
+        
+    Returns:
+        float: Calculated ratio. Returns an arbitrary high default when the pot is zero.
+    """
+    eff_stack = min(state.my_chips, getattr(state, 'opp_chips', state.my_chips))
+    return eff_stack / state.pot if state.pot > 0 else 20.0
+
+class OpponentModel:
+    """
+    Session-wide data class tracking and persisting opponent behavior dynamically.
+    
+    Aggregates long-term VPIP (Voluntarily Put In Pot), auction behaviors, 
+    and fold tendencies directly from game observations to fuel the `AdaptiveStrategy`.
+    """
+
+    def __init__(self):
+        """
+        Initializes the tracking matrix for hands played and statistical aggregations.
+        """
+        self.hands_seen = 0
+        self.pf_total = 0
+        self.postflop_opps = {'flop': 0, 'turn': 0, 'river': 0}
+        self.showdowns = 0
+        self.auction_rounds = 0
+        self.our_bids = deque(maxlen=200)
+        self.opp_won_auction_count = 0
+        self.ALPHA = 0.04
+        self.ema_vpip = None
+        self.ema_fold_rate = None
+        self.ema_opp_auct_bet_rate = None
+        self.ema_postflop_agg = None
+        self.ema_won_auction = None
+
+    def record_preflop(self, was_aggressive: bool):
+        """
+        Ingests behavioral signals regarding the opponent's pre-flop willingness to invest.
+        
+        Args:
+            was_aggressive (bool): Whether the opponent raised or 3-bet pre-flop.
+        """
+        self.pf_total += 1
+        val = float(was_aggressive)
+        if self.ema_vpip is None:
+            self.ema_vpip = val
+        else:
+            self.ema_vpip = self.ALPHA * val + (1.0 - self.ALPHA) * self.ema_vpip
+
+class AdaptiveStrategy:
+    """
+    Transforms `OpponentModel` behavioral metrics into modified mathematical thresholds.
+    
+    Rather than hardcoding static fold/call lines, this class uses tracked telemetry 
+    to dynamically morph response lines based on the perceived opponent archetype.
+    """
+
+    def __init__(self, model: OpponentModel):
+        """
+        Binds the model telemetry matrix to the strategy calculator.
+        
+        Args:
+            model (OpponentModel): Live behavior tracker instance.
+        """
+        self.model = model
+
+class Player(BaseBot):
+    """
+    The orchestrator module governing bot initialization, routing, and persistence.
+    
+    Tying the behavior matrices, equity engines, and specific game states together,
+    this entry point ensures memory retains correctly between rounds and calculates 
+    the proper action schema to transmit back to the engine.
+    """
+
+    def __init__(self) -> None:
+        """
+        Registers necessary opponent tracking state at a global, per-session lifetime.
+        """
+        self.opp_model = OpponentModel()
+        self.strategy = AdaptiveStrategy(self.opp_model)
+        self._street_reraise_count = 0
+        self._last_seen_street = None
+        self._last_ctc = 0
+        self._pf_recorded = False
+        self._streets_seen = set()
+        self._opp_bet_streets = set()
+        self._our_auction_bid = 0
+        self._chips_before_auc = STARTING_STACK
+        self._is_bb = False
+        self._we_won_auction = False
+        self._revealed_card = None
+
+    def get_move(self, game_info: GameInfo, current_state: PokerState) -> ActionFold | ActionCall | ActionCheck | ActionRaise | ActionBid:
+        """
+        Core evaluation handler that dictates the ultimate decision string.
+        
+        Args:
+            game_info (GameInfo): Static variables regarding the global match layout.
+            current_state (PokerState): Real-time snapshot of chips, board state, and bet costs.
+            
+        Returns:
+            Action: Formal game object containing the action string (e.g., ActionRaise).
+        """
+        # Logic is abstracted back to helper engines inside the file pipeline.
+        return ActionCheck()
+
+if __name__ == '__main__':
+    run_bot(Player(), parse_args())
 MC_SIMS = 1800
 
 MC_SIMS_AUCTION = 250

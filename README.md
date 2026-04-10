@@ -1,6 +1,6 @@
 # IIT Pokerbots 2026: Sneak Peek Hold'em Bot
 
-This repository contains our bot implementation for the **IIT Pokerbots 2026 Competition**. The game played is **Sneak Peek Hold'em**, a custom variant of Heads-Up No-Limit Texas Hold'em featuring a unique post-flop second-price auction mechanic.
+This repository contains our bot implementation for the **IIT Pokerbots 2026 Competition** where we placed 41st among 1000+ participants and 500+ teams. The game played is **Sneak Peek Hold'em**, a custom variant of Heads-Up No-Limit Texas Hold'em featuring a unique post-flop second-price auction mechanic.
 
 ## 🃏 The Game: Sneak Peek Hold'em
 
